@@ -168,7 +168,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"
 			}
-			if itemType != "function_call" && itemType != "custom_tool_call" {
+			if itemType != "function_call" && itemType != "custom_tool_call" && itemType != "tool_search_call" {
 				flushPendingToolCalls()
 			}
 
@@ -307,6 +307,39 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				if output := item.Get("output"); output.Exists() {
 					toolMessage = setCustomToolCallOutputContent(toolMessage, output)
 				}
+				appendMessage(toolMessage)
+				if callID != "" {
+					delete(awaitingToolOutputs, callID)
+				}
+				if len(awaitingToolOutputs) == 0 && len(deferredMessages) > 0 {
+					flushDeferredMessages()
+				}
+
+			case "tool_search_call":
+				// OpenAI proprietary dynamic tool discovery call: surface to
+				// Chat Completions providers as a standard function call named
+				// tool_search so third-party models can participate in the
+				// app-connector handshake.
+				toolCall := []byte(`{"id":"","type":"function","function":{"name":"tool_search","arguments":""}}`)
+				toolCall, _ = sjson.SetBytes(toolCall, "id", item.Get("call_id").String())
+				if arguments := item.Get("arguments"); arguments.Exists() {
+					if arguments.Type == gjson.String {
+						toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments.String())
+					} else {
+						toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", arguments.Raw)
+					}
+				}
+				pendingToolCalls = append(pendingToolCalls, gjson.ParseBytes(toolCall).Value())
+				if callID := strings.TrimSpace(item.Get("call_id").String()); callID != "" {
+					pendingToolCallIDs = append(pendingToolCallIDs, callID)
+				}
+
+			case "tool_search_output":
+				mergeableAssistantIndex = -1
+				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
+				callID := strings.TrimSpace(item.Get("call_id").String())
+				toolMessage, _ = sjson.SetBytes(toolMessage, "tool_call_id", callID)
+				toolMessage, _ = sjson.SetBytes(toolMessage, "content", `{"status":"success","tools_loaded":true}`)
 				appendMessage(toolMessage)
 				if callID != "" {
 					delete(awaitingToolOutputs, callID)
