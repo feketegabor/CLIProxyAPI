@@ -246,8 +246,10 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 		t.Fatalf("input.2 exists, want consecutive reasoning item merged; body=%s", string(gotBody))
 	}
 	tools := gjson.GetBytes(gotBody, "tools").Array()
-	if len(tools) != 6 {
-		t.Fatalf("tools length = %d, want 6; body=%s", len(tools), string(gotBody))
+	if len(tools) != 7 {
+		// 7 tools: the tool_search bridge keeps the proprietary declaration as a
+		// callable function so the Codex client can run the handshake locally.
+		t.Fatalf("tools length = %d, want 7; body=%s", len(tools), string(gotBody))
 	}
 	foundAutomationUpdate := false
 	foundNamespaceCustom := false
@@ -3027,8 +3029,10 @@ func TestXAIExecutorExecuteStreamFiltersToolSearchTool(t *testing.T) {
 	}
 
 	tools := gjson.GetBytes(gotBody, "tools").Array()
-	if len(tools) != 6 {
-		t.Fatalf("tools length = %d, want 6; body=%s", len(tools), string(gotBody))
+	if len(tools) != 7 {
+		// 7 tools: the tool_search bridge keeps the proprietary declaration as a
+		// callable function so the Codex client can run the handshake locally.
+		t.Fatalf("tools length = %d, want 7; body=%s", len(tools), string(gotBody))
 	}
 	if gjson.GetBytes(gotBody, "input.0.content").Exists() {
 		t.Fatalf("input.0.content exists, want removed; body=%s", string(gotBody))
