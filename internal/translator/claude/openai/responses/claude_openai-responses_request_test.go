@@ -564,7 +564,7 @@ func TestConvertOpenAIResponsesRequestToClaude_KeepsToolUseAdjacentToToolResult(
 	}
 }
 
-func TestConvertOpenAIResponsesRequestToClaude_DropsApplyPatchCustomTool(t *testing.T) {
+func TestConvertOpenAIResponsesRequestToClaude_PreservesApplyPatchCustomTool(t *testing.T) {
 	raw := []byte(`{
 		"model":"claude-test",
 		"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
@@ -574,6 +574,11 @@ func TestConvertOpenAIResponsesRequestToClaude_DropsApplyPatchCustomTool(t *test
 				"name":"apply_patch",
 				"description":"Use the apply_patch tool to edit files.",
 				"format":{"type":"grammar","syntax":"lark","definition":"start: patch"}
+			},
+			{
+				"type":"namespace",
+				"name":"editor",
+				"tools":[{"type":"custom","name":"apply_patch","description":"Use the apply_patch tool to edit files."}]
 			},
 			{
 				"type":"function",
@@ -587,14 +592,26 @@ func TestConvertOpenAIResponsesRequestToClaude_DropsApplyPatchCustomTool(t *test
 	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
 	root := gjson.ParseBytes(out)
 
-	if got := root.Get("tools.#").Int(); got != 1 {
-		t.Fatalf("tools count = %d, want 1. Output: %s", got, string(out))
+	if got := root.Get("tools.#").Int(); got != 3 {
+		t.Fatalf("tools count = %d, want 3. Output: %s", got, string(out))
 	}
-	if got := root.Get("tools.0.name").String(); got != "exec_command" {
-		t.Fatalf("tools.0.name = %q, want exec_command. Output: %s", got, string(out))
+	for i, name := range []string{"apply_patch", "editor__apply_patch"} {
+		tool := root.Get(fmt.Sprintf("tools.%d", i))
+		if got := tool.Get("name").String(); got != name {
+			t.Fatalf("tool name = %q, want %q. Output: %s", got, name, string(out))
+		}
+		if got := tool.Get("description").String(); got != "Use the apply_patch tool to edit files." {
+			t.Fatalf("tool description = %q. Output: %s", got, string(out))
+		}
+		if got := tool.Get("input_schema").Raw; got != `{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}` {
+			t.Fatalf("unexpected custom input schema: %s", got)
+		}
+		if tool.Get("format").Exists() {
+			t.Fatalf("Claude tool must not retain custom format: %s", tool.Raw)
+		}
 	}
-	if got := root.Get("tools.#(name==\"apply_patch\")").Raw; got != "" {
-		t.Fatalf("apply_patch custom tool should be dropped. Output: %s", string(out))
+	if got := root.Get("tools.2.name").String(); got != "exec_command" {
+		t.Fatalf("tools.2.name = %q, want exec_command. Output: %s", got, string(out))
 	}
 }
 
