@@ -606,6 +606,85 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_QualifiesNamespace
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_QualifiesNamespaceCustomToolCallHistoryPreservingReasoningAndAdjacency(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"reasoning","id":"rs_inspect","summary":[{"type":"summary_text","text":"Inspect the working directory and repository state.\n  Keep both results for the next step.\n"}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'll check the directory and repository state."}]},
+			{"type":"custom_tool_call","call_id":"call_pwd","name":"exec","namespace":"functions","input":"pwd"},
+			{"type":"custom_tool_call","call_id":"call_status","name":"exec","namespace":"functions","input":"git status --short"},
+			{"type":"custom_tool_call_output","call_id":"call_pwd","output":"/workspace/project\n"},
+			{"type":"custom_tool_call_output","call_id":"call_status","output":" M main.go\n"},
+			{"type":"reasoning","id":"rs_review","summary":[{"type":"summary_text","text":"  The repository has a modified Go file.\nReview the diff and recent history before making changes."}]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I'll review the existing change and recent history."}]},
+			{"type":"custom_tool_call","call_id":"call_diff","name":"exec","namespace":"functions","input":"git diff -- main.go"},
+			{"type":"custom_tool_call","call_id":"call_log","name":"exec","namespace":"functions","input":"git log -1 --oneline"},
+			{"type":"custom_tool_call_output","call_id":"call_diff","output":"-return nil\n+return err\n"},
+			{"type":"custom_tool_call_output","call_id":"call_log","output":"abc1234 Fix error handling\n"}
+		],
+		"tools": [{
+			"type":"namespace",
+			"name":"functions",
+			"tools":[{"type":"custom","name":"exec","description":"Run a command"}]
+		}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("kimi-k3", raw, false)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	if got := len(messages); got != 6 {
+		t.Fatalf("messages count = %d, want 6; output=%s", got, out)
+	}
+	if got := gjson.GetBytes(out, "tools.0.function.name").String(); got != "functions__exec" {
+		t.Fatalf("declared function name = %q, want functions__exec; output=%s", got, out)
+	}
+	input := gjson.GetBytes(raw, "input").Array()
+	for turn := 0; turn < 2; turn++ {
+		messageIndex := turn * 3
+		inputIndex := turn * 6
+		assistant := messages[messageIndex]
+		if got := assistant.Get("role").String(); got != "assistant" {
+			t.Fatalf("messages.%d role = %q, want assistant; output=%s", messageIndex, got, out)
+		}
+		if got, want := assistant.Get("reasoning_content").String(), input[inputIndex].Get("summary.0.text").String(); got != want {
+			t.Fatalf("messages.%d reasoning_content = %q, want %q; output=%s", messageIndex, got, want, out)
+		}
+		if got, want := assistant.Get("content.0.text").String(), input[inputIndex+1].Get("content.0.text").String(); got != want {
+			t.Fatalf("messages.%d content = %q, want %q; output=%s", messageIndex, got, want, out)
+		}
+		calls := assistant.Get("tool_calls").Array()
+		if got := len(calls); got != 2 {
+			t.Fatalf("messages.%d tool calls count = %d, want 2; output=%s", messageIndex, got, out)
+		}
+		for callIndex, call := range calls {
+			originalCall := input[inputIndex+2+callIndex]
+			if got := call.Get("function.name").String(); got != "functions__exec" {
+				t.Fatalf("messages.%d tool_calls.%d function name = %q, want functions__exec; output=%s", messageIndex, callIndex, got, out)
+			}
+			if got := call.Get("type").String(); got != "function" {
+				t.Fatalf("messages.%d tool_calls.%d type = %q, want function; output=%s", messageIndex, callIndex, got, out)
+			}
+			if got, want := call.Get("id").String(), originalCall.Get("call_id").String(); got != want {
+				t.Fatalf("messages.%d tool_calls.%d ID = %q, want %q; output=%s", messageIndex, callIndex, got, want, out)
+			}
+			if got, want := gjson.Get(call.Get("function.arguments").String(), "input").String(), originalCall.Get("input").String(); got != want {
+				t.Fatalf("messages.%d tool_calls.%d input = %q, want %q; output=%s", messageIndex, callIndex, got, want, out)
+			}
+			outputIndex := messageIndex + 1 + callIndex
+			output := messages[outputIndex]
+			if got := output.Get("role").String(); got != "tool" {
+				t.Fatalf("messages.%d role = %q, want adjacent tool output; output=%s", outputIndex, got, out)
+			}
+			if got, want := output.Get("tool_call_id").String(), originalCall.Get("call_id").String(); got != want {
+				t.Fatalf("messages.%d tool_call_id = %q, want %q; output=%s", outputIndex, got, want, out)
+			}
+			if got, want := output.Get("content").String(), input[inputIndex+4+callIndex].Get("output").String(); got != want {
+				t.Fatalf("messages.%d content = %q, want %q; output=%s", outputIndex, got, want, out)
+			}
+		}
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_FlattensNamespaceCustomTools(t *testing.T) {
 	tests := []struct {
 		name string
