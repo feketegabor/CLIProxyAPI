@@ -398,7 +398,11 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 			st.FuncCustom[idx] = isCustomTool
 			outputIndex := st.functionOutputIndex(idx)
 			var item []byte
-			if isCustomTool {
+			if name == "tool_search" {
+				item = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"tool_search_call","status":"in_progress","execution":"client","arguments":{},"call_id":""}}`)
+				item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("tsc_%s", st.CurrentFCID))
+				item, _ = sjson.SetBytes(item, "item.call_id", st.CurrentFCID)
+			} else if isCustomTool {
 				item = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"custom_tool_call","status":"in_progress","input":"","call_id":"","name":""}}`)
 				item, _ = sjson.SetBytes(item, "item.id", fmt.Sprintf("ctc_%s", st.CurrentFCID))
 				item, _ = sjson.SetBytes(item, "item.call_id", st.CurrentFCID)
@@ -548,7 +552,17 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 					args = buf.String()
 				}
 			}
-			if st.FuncCustom[idx] {
+			if st.FuncNames[idx] == "tool_search" {
+				itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{"id":"","type":"tool_search_call","status":"completed","execution":"client","arguments":{},"call_id":""}}`)
+				itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
+				itemDone, _ = sjson.SetBytes(itemDone, "output_index", outputIndex)
+				itemDone, _ = sjson.SetBytes(itemDone, "item.id", fmt.Sprintf("tsc_%s", st.CurrentFCID))
+				if args != "" && gjson.Valid(args) {
+					itemDone, _ = sjson.SetRawBytes(itemDone, "item.arguments", []byte(args))
+				}
+				itemDone, _ = sjson.SetBytes(itemDone, "item.call_id", st.CurrentFCID)
+				out = append(out, emitEvent("response.output_item.done", itemDone))
+			} else if st.FuncCustom[idx] {
 				input := unwrapCustomToolInput(args)
 				inputDone := []byte(`{"type":"response.custom_tool_call_input.done","sequence_number":0,"item_id":"","output_index":0,"input":""}`)
 				inputDone, _ = sjson.SetBytes(inputDone, "sequence_number", nextSeq())
@@ -752,7 +766,15 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				if callID == "" && st.CurrentFCID != "" {
 					callID = st.CurrentFCID
 				}
-				if st.FuncCustom[idx] {
+				if name == "tool_search" {
+					item := []byte(`{"id":"","type":"tool_search_call","status":"completed","execution":"client","arguments":{},"call_id":""}`)
+					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("tsc_%s", callID))
+					if args != "" && gjson.Valid(args) {
+						item, _ = sjson.SetRawBytes(item, "arguments", []byte(args))
+					}
+					item, _ = sjson.SetBytes(item, "call_id", callID)
+					outputsWrapper, _ = sjson.SetRawBytes(outputsWrapper, fmt.Sprintf("arr.%d", st.FuncOutputIndices[idx]), item)
+				} else if st.FuncCustom[idx] {
 					item := []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("ctc_%s", callID))
 					item, _ = sjson.SetBytes(item, "input", unwrapCustomToolInput(args))

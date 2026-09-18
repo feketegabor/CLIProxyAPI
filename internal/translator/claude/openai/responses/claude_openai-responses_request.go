@@ -407,6 +407,44 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			case "reasoning":
 				appendReasoning(convertResponsesReasoningToClaudeThinking(item, preserveEmptyThinkingBlocks))
 
+			case "tool_search_call":
+				// OpenAI proprietary dynamic tool discovery call: surface to the
+				// Claude provider as a standard tool_use named tool_search.
+				callID := item.Get("call_id").String()
+				if callID == "" {
+					callID = common.GenerateClaudeToolCallID()
+				}
+				callID = util.SanitizeClaudeToolID(callID)
+				toolUse := []byte(`{"type":"tool_use","id":"","name":"tool_search","input":{}}`)
+				toolUse, _ = sjson.SetBytes(toolUse, "id", callID)
+				if arguments := item.Get("arguments"); arguments.Exists() {
+					if arguments.Type == gjson.String && arguments.String() != "" && gjson.Valid(arguments.String()) {
+						argsJSON := gjson.Parse(arguments.String())
+						if argsJSON.IsObject() {
+							toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(argsJSON.Raw))
+						}
+					} else if arguments.IsObject() {
+						toolUse, _ = sjson.SetRawBytes(toolUse, "input", []byte(arguments.Raw))
+					}
+				}
+				appendToolUse(toolUse)
+
+			case "tool_search_output":
+				// Map the handshake result to a user tool_result for the
+				// preceding tool_search tool_use.
+				rawID := item.Get("call_id").String()
+				callID := util.SanitizeClaudeToolID(rawID)
+				if rawID != "" {
+					if _, exists := emittedToolResults[rawID]; exists {
+						return true
+					}
+					emittedToolResults[rawID] = struct{}{}
+				}
+				toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
+				toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
+				toolResult, _ = sjson.SetBytes(toolResult, "content", `{"status":"success","tools_loaded":true}`)
+				appendParts("user", toolResult)
+
 			case "function_call", "custom_tool_call":
 				// Map to assistant tool_use. Freeform custom input is wrapped in an
 				// object because Claude tool_use input must be a JSON object.
@@ -863,6 +901,8 @@ func convertResponsesToolDescriptorToClaude(descriptor responsesToolDescriptor) 
 		return convertResponsesFunctionToolToClaude(descriptor.tool, overrideName)
 	case "custom":
 		return convertResponsesCustomToolToClaude(descriptor.tool, overrideName)
+	case "tool_search":
+		return convertResponsesToolSearchToolToClaude()
 	case "web_search":
 		return convertResponsesWebSearchToolToClaude(descriptor.tool)
 	default:
@@ -892,7 +932,14 @@ func responsesToolSources(root gjson.Result) []responsesToolSource {
 	appendSource(root.Get("tools"), 0)
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "additional_tools" {
+			itemType := item.Get("type").String()
+			if itemType == "additional_tools" {
+				appendSource(item.Get("tools"), 1)
+			}
+			// Codex Desktop lazy app-connector loading: tools returned by a
+			// completed tool_search handshake must stay callable on the next
+			// turn, so treat their namespaces like any other declaration.
+			if itemType == "tool_search_output" {
 				appendSource(item.Get("tools"), 1)
 			}
 			return true
@@ -945,7 +992,7 @@ func responsesToolDescriptors(root gjson.Result) []responsesToolDescriptor {
 			case "", "function":
 				appendDescriptor(child, qualifiedName, childName, namespaceName, "function", sourcePriority, false)
 			case "custom":
-					appendDescriptor(child, qualifiedName, childName, namespaceName, "custom", sourcePriority, false)
+				appendDescriptor(child, qualifiedName, childName, namespaceName, "custom", sourcePriority, false)
 			}
 			return true
 		})
@@ -957,9 +1004,14 @@ func responsesToolDescriptors(root gjson.Result) []responsesToolDescriptor {
 			case "", "function":
 				appendDescriptor(tool, responsesToolName(tool), "", "", "function", source.priority, true)
 			case "custom":
-					appendDescriptor(tool, responsesToolName(tool), "", "", "custom", source.priority, true)
+				appendDescriptor(tool, responsesToolName(tool), "", "", "custom", source.priority, true)
 			case "namespace":
 				appendNamespaceChildren(tool, source.priority)
+			case "tool_search":
+				// OpenAI proprietary dynamic tool discovery: expose a callable
+				// tool_search function to Claude providers so third-party
+				// models can participate in the app-connector handshake.
+				appendDescriptor(tool, "tool_search", "", "", "tool_search", source.priority, true)
 			case "web_search":
 				if externalWebAccess := tool.Get("external_web_access"); externalWebAccess.Exists() && !externalWebAccess.Bool() {
 					return true
@@ -1182,6 +1234,12 @@ func splitResponsesQualifiedFunctionCallFromRequest(requestRawJSON []byte, quali
 		return descriptor.childName, descriptor.namespace
 	}
 	return qualifiedName, ""
+}
+
+func convertResponsesToolSearchToolToClaude() ([]byte, bool) {
+	tool := []byte(`{"name":"tool_search","type":"custom","input_schema":{"type":"object","properties":{"query":{"type":"string","description":"The name of the app or keywords of what you need, e.g. \"Microsoft Teams\" or \"Gmail\""}},"required":["query"]}}`)
+	tool, _ = sjson.SetBytes(tool, "description", "Search for and activate tools from installed apps (e.g. Microsoft Teams, Gmail, Google Drive, Outlook, Jira, GitHub). Always call this tool when the task requires interacting with an external app or service.")
+	return tool, true
 }
 
 func isUnsupportedOpenAIBuiltinToolType(toolType string) bool {
