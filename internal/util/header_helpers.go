@@ -61,6 +61,19 @@ func extractCustomHeaders(attrs map[string]string, clientHeaders http.Header) ma
 					}
 				}
 			}
+			if clientVal == "" && strings.EqualFold(name, "x-opencode-session") {
+				// ChatGPT/Codex clients carry their session identity in
+				// "session-id" (or thread-id / x-client-request-id) and never
+				// send x-opencode-session, while OpenCode-native clients always
+				// send x-opencode-session. Derive it so every client can use
+				// the same CLIProxyAPI endpoint without a per-client bridge.
+				for _, alt := range []string{"Session-Id", "Thread-Id", "X-Client-Request-Id"} {
+					if altVal := clientHeaders.Get(alt); altVal != "" {
+						clientVal = altVal
+						break
+					}
+				}
+			}
 			if clientVal == "" {
 				continue
 			}
