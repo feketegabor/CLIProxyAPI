@@ -65,7 +65,11 @@ func responsesToolSources(root gjson.Result) []struct {
 	appendSource(root.Get("tools"), 0)
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "additional_tools" {
+			// "additional_tools" carries Codex Desktop (Responses Lite)
+			// declarations; "tool_search_output" carries the tools a completed
+			// tool_search handshake resolved, which must stay callable on the
+			// next turn.
+			if itemType := item.Get("type").String(); itemType == "additional_tools" || itemType == "tool_search_output" {
 				appendSource(item.Get("tools"), 1)
 			}
 			return true
@@ -138,6 +142,8 @@ func CollectResponsesToolDescriptors(root gjson.Result) []ResponsesToolDescripto
 				appendDescriptor(child, qualifiedName, childName, namespaceName, "function", sourcePriority, false)
 			case "custom":
 				appendDescriptor(child, qualifiedName, childName, namespaceName, "custom", sourcePriority, false)
+			case "tool_search":
+				appendDescriptor(child, "tool_search", "tool_search", namespaceName, "tool_search", sourcePriority, false)
 			}
 			return true
 		})
@@ -152,6 +158,8 @@ func CollectResponsesToolDescriptors(root gjson.Result) []ResponsesToolDescripto
 			case "custom":
 				name := responsesToolName(tool)
 				appendDescriptor(tool, name, name, "", "custom", source.priority, true)
+			case "tool_search":
+				appendDescriptor(tool, "tool_search", "tool_search", "", "tool_search", source.priority, true)
 			case "namespace":
 				appendNamespaceChildren(tool, source.priority)
 			}
@@ -296,6 +304,12 @@ func BuildGeminiFunctionDeclarations(root gjson.Result) ([][]byte, map[string]st
 
 		funcDecl := []byte(`{"name":"","description":"","parametersJsonSchema":{}}`)
 		funcDecl, _ = sjson.SetBytes(funcDecl, "name", geminiName)
+		if desc.ToolType == "tool_search" {
+			funcDecl, _ = sjson.SetBytes(funcDecl, "description", responsesToolSearchDeclarationDescription(desc.Tool))
+			funcDecl, _ = sjson.SetRawBytes(funcDecl, "parametersJsonSchema", []byte(responsesToolSearchParametersJSON))
+			declarations = append(declarations, funcDecl)
+			continue
+		}
 		if descStr := responsesToolDescription(desc.Tool); descStr != "" {
 			funcDecl, _ = sjson.SetBytes(funcDecl, "description", descStr)
 		}
@@ -415,4 +429,20 @@ func UnwrapResponsesCustomToolInput(arguments string) string {
 		}
 	}
 	return arguments
+}
+
+// responsesToolSearchParametersJSON is the Gemini functionDeclaration parameter
+// schema synthesized for the ChatGPT app-connector tool_search handshake: the
+// proprietary {"type":"tool_search"} declaration carries no parameters, but the
+// upstream callable function needs the query argument the client expects.
+const responsesToolSearchParametersJSON = `{"type":"object","properties":{"query":{"type":"string","description":"The name of the app or keywords of what you need, e.g. \"Microsoft Teams\" or \"Gmail\""}},"required":["query"]}`
+
+// responsesToolSearchDeclarationDescription returns the description for the
+// synthesized tool_search function declaration, preferring the description the
+// client attached to the proprietary declaration when present.
+func responsesToolSearchDeclarationDescription(tool gjson.Result) string {
+	if description := responsesToolDescription(tool); description != "" {
+		return description
+	}
+	return "Search for and activate tools from installed apps (e.g. Microsoft Teams, Gmail, Google Drive, Outlook, Jira, GitHub). Always call this tool when the task requires interacting with an external app or service."
 }
