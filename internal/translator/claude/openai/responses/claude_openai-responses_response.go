@@ -924,6 +924,7 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 				}
 				if name == "tool_search" {
 					item := []byte(`{"id":"","type":"tool_search_call","status":"completed","execution":"client","arguments":{},"call_id":""}`)
+					item, _ = sjson.SetBytes(item, "status", status)
 					item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("tsc_%s", callID))
 					if args != "" && gjson.Valid(args) {
 						item, _ = sjson.SetRawBytes(item, "arguments", []byte(args))
