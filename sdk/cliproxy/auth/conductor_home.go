@@ -356,14 +356,15 @@ type homeAuthDispatchResponse struct {
 }
 
 type homeDispatchModelInfo struct {
-	ID                  string                    `json:"id"`
-	Type                string                    `json:"type,omitempty"`
-	InputTokenLimit     int                       `json:"inputTokenLimit,omitempty"`
-	OutputTokenLimit    int                       `json:"outputTokenLimit,omitempty"`
-	ContextLength       int                       `json:"context_length,omitempty"`
-	MaxCompletionTokens int                       `json:"max_completion_tokens,omitempty"`
-	Thinking            *registry.ThinkingSupport `json:"thinking,omitempty"`
-	UserDefined         bool                      `json:"user_defined"`
+	ID                  string                       `json:"id"`
+	Type                string                       `json:"type,omitempty"`
+	InputTokenLimit     int                          `json:"inputTokenLimit,omitempty"`
+	OutputTokenLimit    int                          `json:"outputTokenLimit,omitempty"`
+	ContextLength       int                          `json:"context_length,omitempty"`
+	MaxCompletionTokens int                          `json:"max_completion_tokens,omitempty"`
+	Thinking            *registry.ThinkingSupport    `json:"thinking,omitempty"`
+	NativeCapabilities  *registry.NativeCapabilities `json:"native_capabilities,omitempty"`
+	UserDefined         bool                         `json:"user_defined"`
 }
 
 func (m *homeDispatchModelInfo) registryModelInfo() *registry.ModelInfo {
@@ -378,6 +379,7 @@ func (m *homeDispatchModelInfo) registryModelInfo() *registry.ModelInfo {
 		ContextLength:       m.ContextLength,
 		MaxCompletionTokens: m.MaxCompletionTokens,
 		Thinking:            m.Thinking,
+		NativeCapabilities:  m.NativeCapabilities,
 		UserDefined:         m.UserDefined,
 	}
 }
@@ -998,6 +1000,14 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 	}
 
 	sessionID, parentSessionID := m.homeDispatchSessionIDs(opts)
+	if sessionID != "" && opts.Metadata != nil {
+		opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey] = sessionID
+		if parentSessionID != "" {
+			opts.Metadata[cliproxyexecutor.ParentSessionIDMetadataKey] = parentSessionID
+		} else {
+			delete(opts.Metadata, cliproxyexecutor.ParentSessionIDMetadataKey)
+		}
+	}
 	dispatchHeaders := homeDispatchHeaders(ctx, opts.Headers)
 	credentialPolicy := credentialPolicyFromContext(ctx)
 	var raw []byte
@@ -1200,6 +1210,8 @@ func (m *Manager) pickHomeDispatchSelection(ctx context.Context, model string, o
 			return nil, errEnd
 		}
 	}
+	selection.CanonicalSessionID = sessionID
+	selection.ParentSessionID = parentSessionID
 	return selection, nil
 }
 
@@ -1391,6 +1403,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, pooled)
 			execReq := req
 			execReq.Model = upstreamModel
+			creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
 			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
 			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: creditsOpts}
 			if errExec != nil {
@@ -1448,6 +1461,7 @@ func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cl
 		if len(models) == 0 {
 			continue
 		}
+		creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
 		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, "", models, pooled, aliasResult, routing, true, false)
 		if errStream != nil {
 			continue
