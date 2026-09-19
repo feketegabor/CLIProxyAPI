@@ -494,3 +494,33 @@ func RestoreSanitizedToolName(toolNameMap map[string]string, sanitizedName strin
 	}
 	return sanitizedName
 }
+
+// RestoreTruncatedGeminiToolIdentity resolves a Gemini function name back to
+// its Responses tool identity when the model truncated a qualified name to its
+// local suffix (a recurring Gemini behavior with long namespace tool names).
+// Exact matches win; otherwise a unique key ending in the namespace separator
+// "__" plus the raw name is accepted.
+func RestoreTruncatedGeminiToolIdentity(identityMap map[string]ResponsesToolIdentity, rawName string) (ResponsesToolIdentity, bool) {
+	if rawName == "" || identityMap == nil {
+		return ResponsesToolIdentity{}, false
+	}
+	if identity, ok := identityMap[rawName]; ok {
+		return identity, true
+	}
+	suffix := "__" + rawName
+	var match ResponsesToolIdentity
+	matches := 0
+	for key, identity := range identityMap {
+		if strings.HasSuffix(key, suffix) {
+			matches++
+			if matches > 1 {
+				return ResponsesToolIdentity{}, false
+			}
+			match = identity
+		}
+	}
+	if matches == 1 {
+		return match, true
+	}
+	return ResponsesToolIdentity{}, false
+}

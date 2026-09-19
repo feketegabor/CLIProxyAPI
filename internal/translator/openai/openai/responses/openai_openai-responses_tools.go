@@ -14,11 +14,12 @@ import (
 // their declared name and the owning namespace, so reverse translation can
 // restore the split identity.
 type responsesToolDeclaration struct {
-	tool      gjson.Result
-	chatName  string
-	localName string
-	namespace string
-	custom    bool
+	tool         gjson.Result
+	chatName     string
+	localName    string
+	namespace    string
+	custom       bool
+	isToolSearch bool
 }
 
 // walkResponsesToolDeclarations visits the tool declarations of a Responses
@@ -36,23 +37,30 @@ func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDe
 	var declarations []responsesToolDeclaration
 	emit := func(tool gjson.Result, namespaceName string) {
 		var custom bool
+		var isToolSearch bool
 		switch strings.TrimSpace(tool.Get("type").String()) {
 		case "", "function":
 		case "custom":
 			custom = true
+		case "tool_search":
+			isToolSearch = true
 		default:
 			return
 		}
 		localName := responsesToolName(tool)
+		if isToolSearch {
+			localName = "tool_search"
+		}
 		if localName == "" {
 			return
 		}
 		declarations = append(declarations, responsesToolDeclaration{
-			tool:      tool,
-			chatName:  qualifyResponsesNamespaceToolName(namespaceName, localName),
-			localName: localName,
-			namespace: namespaceName,
-			custom:    custom,
+			tool:         tool,
+			chatName:     qualifyResponsesNamespaceToolName(namespaceName, localName),
+			localName:    localName,
+			namespace:    namespaceName,
+			custom:       custom,
+			isToolSearch: isToolSearch,
 		})
 	}
 	scan := func(tools gjson.Result) {
@@ -78,7 +86,14 @@ func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDe
 	scan(root.Get("tools"))
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "additional_tools" {
+			itemType := item.Get("type").String()
+			if itemType == "additional_tools" {
+				scan(item.Get("tools"))
+			}
+			// Codex Desktop lazy app-connector loading: tools returned by a
+			// completed tool_search handshake must stay callable on the next
+			// turn, so treat their namespaces like any other declaration.
+			if itemType == "tool_search_output" {
 				scan(item.Get("tools"))
 			}
 			return true
@@ -206,7 +221,9 @@ func mergeResponsesRequestChatTools(root gjson.Result) [][]byte {
 			return true
 		}
 		convert := convertResponsesFunctionToolToOpenAIChat
-		if declaration.custom {
+		if declaration.isToolSearch {
+			convert = convertResponsesToolSearchToOpenAIChat
+		} else if declaration.custom {
 			convert = convertResponsesCustomToolToOpenAIChat
 		}
 		if chatTool, ok := convert(declaration.tool, declaration.chatName); ok {
@@ -221,6 +238,16 @@ func mergeResponsesRequestChatTools(root gjson.Result) [][]byte {
 // convertResponsesCustomToolToOpenAIChat maps a Responses freeform ("custom")
 // tool onto a Chat Completions function tool with a single freeform "input"
 // string, mirroring the function-based shape Codex uses for apply_patch.
+func convertResponsesToolSearchToOpenAIChat(tool gjson.Result, overrideName string) ([]byte, bool) {
+	name := strings.TrimSpace(overrideName)
+	if name == "" {
+		name = "tool_search"
+	}
+	chatTool := []byte(`{"type":"function","function":{"name":"","description":"Search for and activate tools from installed apps (e.g. Microsoft Teams, Gmail, Google Drive, Outlook, Jira, GitHub). Always call this tool when the task requires interacting with an external app or service.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"The name of the app or keywords of what you need, e.g. \"Microsoft Teams\" or \"Gmail\""}},"required":["query"]}}}`)
+	chatTool, _ = sjson.SetBytes(chatTool, "function.name", name)
+	return chatTool, true
+}
+
 func convertResponsesCustomToolToOpenAIChat(tool gjson.Result, overrideName string) ([]byte, bool) {
 	name := strings.TrimSpace(overrideName)
 	if name == "" {

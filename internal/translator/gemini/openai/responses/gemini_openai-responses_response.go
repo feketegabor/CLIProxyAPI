@@ -1044,6 +1044,13 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 				rawName := fc.Get("name").String()
 				identity, hasIdentity := st.ToolIdentityMap[rawName]
 				if !hasIdentity {
+					// Gemini truncates long qualified tool names to their local
+					// suffix; restore the owning namespace when it is unique.
+					if restoredIdentity, ok := util.RestoreTruncatedGeminiToolIdentity(st.ToolIdentityMap, rawName); ok {
+						identity, hasIdentity = restoredIdentity, true
+					}
+				}
+				if !hasIdentity {
 					restored := util.RestoreSanitizedToolName(st.SanitizedNameMap, rawName)
 					identity = util.ResponsesToolIdentity{Name: restored}
 				}
@@ -1389,7 +1396,7 @@ func ConvertGeminiResponseToOpenAIResponses(_ context.Context, modelName string,
 		st.Completed = true
 	}
 
-	return out
+	return rewriteGeminiResponsesToolSearchEvents(out)
 }
 
 // ConvertGeminiResponseToOpenAIResponsesNonStream aggregates Gemini response JSON into a single OpenAI Responses JSON object.
@@ -1651,6 +1658,13 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 				rawName := fc.Get("name").String()
 				identity, hasIdentity := toolIdentityMap[rawName]
 				if !hasIdentity {
+					// Gemini truncates long qualified tool names to their local
+					// suffix; restore the owning namespace when it is unique.
+					if restoredIdentity, ok := util.RestoreTruncatedGeminiToolIdentity(toolIdentityMap, rawName); ok {
+						identity, hasIdentity = restoredIdentity, true
+					}
+				}
+				if !hasIdentity {
 					restored := util.RestoreSanitizedToolName(sanitizedNameMap, rawName)
 					identity = util.ResponsesToolIdentity{Name: restored}
 				}
@@ -1844,5 +1858,5 @@ func ConvertGeminiResponseToOpenAIResponsesNonStream(_ context.Context, _ string
 		}
 	}
 
-	return resp
+	return rewriteGeminiResponsesToolSearchNonStream(resp)
 }

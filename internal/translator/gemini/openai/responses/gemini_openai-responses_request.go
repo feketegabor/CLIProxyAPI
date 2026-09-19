@@ -17,6 +17,10 @@ const geminiResponsesThoughtSignature = "skip_thought_signature_validator"
 func ConvertOpenAIResponsesRequestToGemini(modelName string, inputRawJSON []byte, stream bool) []byte {
 	rawJSON := inputRawJSON
 
+	// ChatGPT app-connector bridge: replay the proprietary tool_search
+	// handshake as a standard function round trip before Gemini conversion.
+	rawJSON = bridgeToolSearchForGemini(rawJSON)
+
 	// Note: stream parameter is part of the fixed method signature
 	useGeminiNativeReasoningLayout := sigcompat.SignatureProviderFromModelName(modelName) == sigcompat.SignatureProviderGemini
 	_ = stream // Unused but required by interface

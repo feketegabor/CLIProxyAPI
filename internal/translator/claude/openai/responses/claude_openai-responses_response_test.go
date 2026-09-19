@@ -934,6 +934,105 @@ func TestConvertClaudeResponseToOpenAIResponses_RestoresAdditionalNamespaceCusto
 	}
 }
 
+func TestConvertClaudeResponseToOpenAIResponses_ApplyPatchCustomToolRawInput(t *testing.T) {
+	patch := "*** Begin Patch\n*** Add File: hello.txt\n+hello \"world\"\n*** End Patch\n"
+	for _, tt := range []struct {
+		name      string
+		tools     string
+		toolName  string
+		namespace string
+	}{
+		{
+			name:     "top-level",
+			tools:    `[{"type":"custom","name":"apply_patch"}]`,
+			toolName: "apply_patch",
+		},
+		{
+			name:      "namespaced",
+			tools:     `[{"type":"namespace","name":"editor","tools":[{"type":"custom","name":"apply_patch"}]}]`,
+			toolName:  "editor__apply_patch",
+			namespace: "editor",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			originalRequest := []byte(`{"model":"gpt-test","tools":` + tt.tools + `}`)
+			translatedRequest := ConvertOpenAIResponsesRequestToClaude("claude-test", originalRequest, true)
+			arguments := fmt.Sprintf(`{"input":%q}`, patch)
+			chunks := []string{
+				`data: {"type":"message_start","message":{"id":"msg_patch","usage":{"input_tokens":1,"output_tokens":0}}}`,
+				fmt.Sprintf(`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_patch","name":%q,"input":{}}}`, tt.toolName),
+				fmt.Sprintf(`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":%q}}`, arguments[:len(arguments)/2]),
+				fmt.Sprintf(`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":%q}}`, arguments[len(arguments)/2:]),
+				`data: {"type":"content_block_stop","index":0}`,
+				`data: {"type":"message_stop"}`,
+			}
+			assertItem := func(t *testing.T, item gjson.Result, input string) {
+				t.Helper()
+				if got := item.Get("type").String(); got != "custom_tool_call" {
+					t.Fatalf("item type = %q, want custom_tool_call; item=%s", got, item.Raw)
+				}
+				if got := item.Get("name").String(); got != "apply_patch" {
+					t.Fatalf("item name = %q, want apply_patch", got)
+				}
+				if got := item.Get("namespace").String(); got != tt.namespace {
+					t.Fatalf("item namespace = %q, want %q", got, tt.namespace)
+				}
+				if tt.namespace == "" && item.Get("namespace").Exists() {
+					t.Fatalf("unexpected namespace: %s", item.Raw)
+				}
+				if got := item.Get("call_id").String(); got != "call_patch" {
+					t.Fatalf("item call_id = %q, want call_patch", got)
+				}
+				if got := item.Get("input"); got.Type != gjson.String || got.String() != input {
+					t.Fatalf("item input = %s, want raw input %q", got.Raw, input)
+				}
+				if item.Get("arguments").Exists() {
+					t.Fatalf("custom tool call must not have arguments: %s", item.Raw)
+				}
+			}
+
+			t.Run("stream", func(t *testing.T) {
+				var param any
+				var added, inputDone, done, completed gjson.Result
+				for _, chunk := range chunks {
+					for _, output := range ConvertClaudeResponseToOpenAIResponses(context.Background(), "claude-test", originalRequest, translatedRequest, []byte(chunk), &param) {
+						event, data := parseClaudeResponsesSSEEvent(t, output)
+						switch event {
+						case "response.output_item.added":
+							added = data.Get("item")
+						case "response.custom_tool_call_input.done":
+							inputDone = data.Get("input")
+						case "response.output_item.done":
+							done = data.Get("item")
+						case "response.completed":
+							completed = data.Get("response")
+						case "response.function_call_arguments.delta", "response.function_call_arguments.done":
+							t.Fatalf("unexpected function call event: %s", event)
+						}
+					}
+				}
+				assertItem(t, added, "")
+				assertItem(t, done, patch)
+				assertItem(t, completed.Get("output.0"), patch)
+				if got := completed.Get("output.#").Int(); got != 1 {
+					t.Fatalf("stream output count = %d, want 1", got)
+				}
+				if inputDone.Type != gjson.String || inputDone.String() != patch {
+					t.Fatalf("custom input.done = %s, want raw patch %q", inputDone.Raw, patch)
+				}
+			})
+			t.Run("nonstream", func(t *testing.T) {
+				out := ConvertClaudeResponseToOpenAIResponsesNonStream(context.Background(), "claude-test", originalRequest, translatedRequest, []byte(strings.Join(chunks, "\n")), nil)
+				root := gjson.ParseBytes(out)
+				if got := root.Get("output.#").Int(); got != 1 {
+					t.Fatalf("non-stream output count = %d, want 1", got)
+				}
+				assertItem(t, root.Get("output.0"), patch)
+			})
+		})
+	}
+}
+
 func TestConvertClaudeResponseToOpenAIResponses_DirectCustomWinsNamespaceCollision(t *testing.T) {
 	originalRequest := []byte(`{
 		"model":"gpt-test",

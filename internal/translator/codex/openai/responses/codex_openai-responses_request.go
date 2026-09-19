@@ -3,6 +3,7 @@ package responses
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
@@ -27,8 +28,23 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	rawJSON = setCodexRequiredInclude(rawJSON)
 	// Codex Responses rejects token limit fields, so strip them out before forwarding.
 	rawJSON = deleteCodexRequestFields(rawJSON, "max_output_tokens", "max_completion_tokens", "temperature", "top_p")
-	if serviceTier := gjson.GetBytes(rawJSON, "service_tier"); serviceTier.Exists() && serviceTier.String() != "priority" {
-		rawJSON = deleteCodexRequestFields(rawJSON, "service_tier")
+	if serviceTier := gjson.GetBytes(rawJSON, "service_tier"); serviceTier.Exists() {
+		if serviceTier.Type == gjson.String {
+			switch strings.ToLower(strings.TrimSpace(serviceTier.String())) {
+			case "priority", "fast":
+				if serviceTier.String() != "priority" {
+					rawJSON, _ = sjson.SetBytes(rawJSON, "service_tier", "priority")
+				}
+			case "ultrafast":
+				if serviceTier.String() != "ultrafast" {
+					rawJSON, _ = sjson.SetBytes(rawJSON, "service_tier", "ultrafast")
+				}
+			default:
+				rawJSON = deleteCodexRequestFields(rawJSON, "service_tier")
+			}
+		} else {
+			rawJSON = deleteCodexRequestFields(rawJSON, "service_tier")
+		}
 	}
 
 	rawJSON = deleteCodexRequestFields(rawJSON, "truncation", "prompt_cache_options", "prompt_cache_retention")
@@ -41,10 +57,165 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	// Convert role "system" to "developer" in input array to comply with Codex API requirements.
 	rawJSON = convertSystemRoleToDeveloper(rawJSON)
 	rawJSON = normalizeCodexBuiltinTools(rawJSON)
+	rawJSON = bridgeToolSearchForCodex(rawJSON)
 
 	return rawJSON
 }
 
+// bridgeToolSearchForCodex adapts the OpenAI proprietary tool_search handshake
+// for Codex-format upstreams. Providers behind this translator reject the
+// native {"type":"tool_search"} declaration and namespace tool declarations,
+// so the handshake is replayed as a standard function round trip:
+//
+//  1. The native tool_search declaration becomes a callable function tool.
+//  2. A completed handshake in the input history (tool_search_call plus
+//     tool_search_output) becomes a standard function_call/function_call_output
+//     pair, and the tools the client resolved are pre-registered on the
+//     upstream tools list as flat qualified function names.
+//  3. Namespace tool declarations are flattened the same way so the upstream
+//     never sees a namespace object.
+//
+// ConvertCodexResponseToOpenAIResponses reverses the qualified names back into
+// name + namespace items so the Codex client keeps executing the tools through
+// their owning namespace.
+func bridgeToolSearchForCodex(rawJSON []byte) []byte {
+	hasToolSearch := false
+	if tools := gjson.GetBytes(rawJSON, "tools"); tools.IsArray() {
+		for _, tool := range tools.Array() {
+			if tool.Get("type").String() == "tool_search" {
+				hasToolSearch = true
+				break
+			}
+		}
+	}
+	if input := gjson.GetBytes(rawJSON, "input"); input.IsArray() {
+		for _, item := range input.Array() {
+			itemType := item.Get("type").String()
+			if itemType == "tool_search_call" || itemType == "tool_search_output" {
+				hasToolSearch = true
+				break
+			}
+		}
+	}
+	if !hasToolSearch {
+		return rawJSON
+	}
+
+	qualifiedNames := make(map[string]struct{})
+	flatTools := make([][]byte, 0, 32)
+
+	flattenChild := func(namespaceName string, child gjson.Result) {
+		localName := child.Get("name").String()
+		if localName == "" {
+			// Nameless builtin tool declarations (e.g. web_search) have no
+			// namespace identity; pass them through untouched so provider-side
+			// injection and shaping keep working.
+			flatTools = append(flatTools, []byte(child.Raw))
+			return
+		}
+		qualified := localName
+		if namespaceName != "" && !strings.HasPrefix(localName, "mcp__") && !strings.HasPrefix(localName, namespaceName) {
+			qualified = namespaceName + "__" + localName
+		}
+		if _, dup := qualifiedNames[qualified]; dup {
+			return
+		}
+		qualifiedNames[qualified] = struct{}{}
+		updated, errSet := sjson.SetBytes([]byte(child.Raw), "name", qualified)
+		if errSet != nil {
+			return
+		}
+		flatTools = append(flatTools, updated)
+	}
+
+	flattenTool := func(tool gjson.Result) {
+		switch strings.TrimSpace(tool.Get("type").String()) {
+		case "tool_search":
+			// Replace the proprietary declaration with a callable function so
+			// the model can trigger the handshake through a standard call.
+			if _, dup := qualifiedNames["tool_search"]; !dup {
+				qualifiedNames["tool_search"] = struct{}{}
+				synthetic := []byte(`{"type":"function","name":"tool_search","description":"Search for and activate tools from installed apps (e.g. Microsoft Teams, Gmail, Google Drive, Outlook, Jira, GitHub). Always call this tool when the task requires interacting with an external app or service.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"The name of the app or keywords of what you need, e.g. Microsoft Teams or Gmail"}},"required":["query"]}}`)
+				flatTools = append(flatTools, synthetic)
+			}
+			return
+		case "namespace":
+			namespaceName := strings.TrimSpace(tool.Get("name").String())
+			if children := tool.Get("tools"); children.IsArray() {
+				for _, child := range children.Array() {
+					flattenChild(namespaceName, child)
+				}
+			}
+		default:
+			flattenChild("", tool)
+		}
+	}
+
+	// Flatten top-level tools (includes the native tool_search declaration).
+	if tools := gjson.GetBytes(rawJSON, "tools"); tools.IsArray() {
+		for _, tool := range tools.Array() {
+			flattenTool(tool)
+		}
+	}
+
+	// Replay the handshake history and harvest the resolved tools.
+	if input := gjson.GetBytes(rawJSON, "input"); input.IsArray() {
+		rebuiltInput := make([]json.RawMessage, 0, len(input.Array()))
+		changed := false
+		for _, item := range input.Array() {
+			itemRaw := []byte(item.Raw)
+			switch item.Get("type").String() {
+			case "tool_search_call":
+				changed = true
+				callID := item.Get("call_id").String()
+				if callID == "" {
+					callID = "call_codex_tool_search"
+				}
+				call, _ := sjson.SetBytes([]byte(`{"type":"function_call","call_id":"","name":"tool_search","arguments":"{}"}`), "call_id", callID)
+				if arguments := item.Get("arguments"); arguments.Exists() {
+					if arguments.Type == gjson.String && arguments.String() != "" {
+						call, _ = sjson.SetBytes(call, "arguments", arguments.String())
+					} else {
+						call, _ = sjson.SetBytes(call, "arguments", arguments.Raw)
+					}
+				}
+				rebuiltInput = append(rebuiltInput, call)
+			case "tool_search_output":
+				changed = true
+				callID := item.Get("call_id").String()
+				if callID == "" {
+					callID = "call_codex_tool_search"
+				}
+				output, _ := sjson.SetBytes([]byte(`{"type":"function_call_output","call_id":"","output":""}`), "call_id", callID)
+				output, _ = sjson.SetBytes(output, "output", `{"status":"success","tools_loaded":true}`)
+				rebuiltInput = append(rebuiltInput, output)
+				if tools := item.Get("tools"); tools.IsArray() {
+					for _, tool := range tools.Array() {
+						flattenTool(tool)
+					}
+				}
+			default:
+				rebuiltInput = append(rebuiltInput, itemRaw)
+			}
+		}
+		if changed {
+			if marshaled, errMarshal := json.Marshal(rebuiltInput); errMarshal == nil {
+				if updated, errSet := sjson.SetRawBytes(rawJSON, "input", marshaled); errSet == nil {
+					rawJSON = updated
+				}
+			}
+		}
+	}
+
+	if len(flatTools) > 0 {
+		updated, errSet := sjson.SetRawBytes(rawJSON, "tools", translatorcommon.JoinRawArray(flatTools))
+		if errSet == nil {
+			rawJSON = updated
+		}
+	}
+
+	return rawJSON
+}
 func setCodexRequiredBool(rawJSON []byte, path string, value bool) []byte {
 	current := gjson.GetBytes(rawJSON, path)
 	if value && current.Type == gjson.True || !value && current.Type == gjson.False {
@@ -87,11 +258,12 @@ func deleteCodexRequestFields(rawJSON []byte, paths ...string) []byte {
 }
 
 // stripCodexResponsesCacheBreakpoints removes any "prompt_cache_breakpoint" hint
-// attached to individual input[].content[] items. Some clients (e.g. GitHub
-// Copilot CLI) attach this field per content item when targeting the OpenAI
-// Responses format. Codex Responses rejects it outright:
+// attached to input items: inside content-part arrays (message input[].content[]
+// and function_call_output input[].output[]) or as an item-level field. Some
+// clients (e.g. GitHub Copilot CLI) attach this field per content item when
+// targeting the OpenAI Responses format. Codex Responses rejects it outright:
 // {"error":{"message":"prompt_cache_breakpoint is not supported on this model", ...}}.
-// The top-level prompt_cache_options strip above does not cover this nested case.
+// The top-level prompt_cache_options strip above does not cover these nested cases.
 func stripCodexResponsesCacheBreakpoints(rawJSON []byte) []byte {
 	if !bytes.Contains(rawJSON, []byte(`"prompt_cache_breakpoint"`)) {
 		return rawJSON
@@ -111,14 +283,24 @@ func stripCodexResponsesCacheBreakpoints(rawJSON []byte) []byte {
 	rebuiltInput := make([][]byte, 0, len(inputItems))
 	for _, item := range inputItems {
 		itemRaw := []byte(item.Raw)
-		content := item.Get("content")
-		if content.IsArray() {
-			updatedContent, contentChanged := stripPromptCacheBreakpointFromContent(content)
-			if contentChanged {
-				if updatedItem, errSet := sjson.SetRawBytes(itemRaw, "content", updatedContent); errSet == nil {
-					itemRaw = updatedItem
-					changed = true
-				}
+		for _, arrayPath := range []string{"content", "output"} {
+			arrayResult := item.Get(arrayPath)
+			if !arrayResult.IsArray() {
+				continue
+			}
+			updatedArray, arrayChanged := stripPromptCacheBreakpointFromContent(arrayResult)
+			if !arrayChanged {
+				continue
+			}
+			if updatedItem, errSet := sjson.SetRawBytes(itemRaw, arrayPath, updatedArray); errSet == nil {
+				itemRaw = updatedItem
+				changed = true
+			}
+		}
+		if item.Get("prompt_cache_breakpoint").Exists() {
+			if updatedItem, errDelete := sjson.DeleteBytes(itemRaw, "prompt_cache_breakpoint"); errDelete == nil {
+				itemRaw = updatedItem
+				changed = true
 			}
 		}
 		rebuiltInput = append(rebuiltInput, itemRaw)
