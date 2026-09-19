@@ -7,9 +7,11 @@ native GPT models into a proxy catalog does not make them use native ChatGPT.
 ## Preserve the native default
 
 Keep the user's ChatGPT sign-in. Do not replace or delete `auth.json`.
-Remove global `model_provider`, `openai_base_url`, and `model_catalog_json`
-overrides to use the built-in provider and supplied catalog. Preserve unrelated
-settings and take private backups before making changes.
+Remove global `model_provider` and `openai_base_url` overrides to use the built-in
+provider by default. A global `model_catalog_json` may contain both official native
+records and custom records so both are listed. Removing that catalog hides custom
+choices and is inappropriate when the user wants a combined selector. Preserve
+unrelated settings and take private backups before making changes.
 
 For opt-in custom inference, current Codex versions support a separate
 `$CODEX_HOME/custom_models.config.toml` file:
@@ -36,12 +38,16 @@ a custom-provider session. Existing app configurations using
 that setting can send OpenAI authentication to the configured provider and is not
 a per-model routing switch.
 
-The Desktop model selector is not a provider selector. In the inspected app-server
-protocol, thread start/resume accepts `modelProvider`, but turn start changes only
-the model. Therefore a single mixed selector requires provider-aware client
-behavior. Do not invent a provider field in catalog entries or advertise native
-models as native while routing them through this proxy. Existing tasks may retain
-their previous provider after the global configuration changes.
+A combined catalog was verified to return both native and custom entries through
+the bundled app-server model list. This establishes visibility, not automatic
+provider routing. In the inspected protocol, thread start/resume accepts
+`modelProvider`, while turn start exposes a model selection. That observation alone
+does not establish that mixed Desktop usage is impossible. Verify the client
+behavior and each request destination before claiming native-direct and custom
+routes switch correctly from the composer. A separate CLI profile is useful for
+testing but does not fulfill a combined Desktop selector requirement. Do not invent
+a provider field in catalog entries or label proxy-routed requests as native-direct.
+Existing tasks may retain their previous provider after global configuration changes.
 
 ## Remove an extra gateway only after verification
 
